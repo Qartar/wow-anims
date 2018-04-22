@@ -84,25 +84,83 @@ SIZE_T SearchProcessMemory(
 }
 
 //------------------------------------------------------------------------------
+template<typename T, std::size_t Sz> SIZE_T SearchProcessMemory(
+    HANDLE hProcess,
+    std::vector<MEMORY_BASIC_INFORMATION> const& MemoryInfo,
+    T const (&lpSearch)[Sz])
+{
+    return SearchProcessMemory(hProcess, MemoryInfo, (LPCVOID)lpSearch, sizeof(lpSearch));
+}
+
+//------------------------------------------------------------------------------
+template<typename POINTER_TYPE>
 BOOL ReadProcessStringPointer(
     HANDLE hProcess,
     SIZE_T Address,
     LPSTR Buffer,
     SIZE_T dwLength)
 {
-    SIZE_T Pointer, Size;
+    POINTER_TYPE Pointer;
+    SIZE_T Size;
 
     ReadProcessMemory(hProcess, (LPCVOID)Address, &Pointer, sizeof(Pointer), &Size);
     if (Size != sizeof(Pointer)) {
         return FALSE;
     }
 
-    ReadProcessMemory(hProcess, (LPCVOID)Pointer, Buffer, dwLength, &Size);
+    ReadProcessMemory(hProcess, (LPCVOID)(SIZE_T)Pointer, Buffer, dwLength, &Size);
     if (Size == 0) {
         return FALSE;
     }
 
     return TRUE;
+}
+
+//------------------------------------------------------------------------------
+template<typename POINTER_TYPE>
+BOOL ScanAnimations(
+    LPCWSTR OutputPath,
+    LPCSTR Version,
+    HANDLE hProcess,
+    std::vector<MEMORY_BASIC_INFORMATION> const& MemoryInfo,
+    POINTER_TYPE AddressOfStand)
+{
+    // Search process memory for the first instance of a pointer to "Stand" which
+    // will be the beginning of the array of animation names.
+    SIZE_T Offset = SearchProcessMemory(hProcess,
+                                        MemoryInfo,
+                                        &AddressOfStand,
+                                        sizeof(AddressOfStand));
+
+    // Failed to find the beginning of the array of animation names.
+    if (Offset == 0) {
+        return FALSE;
+    }
+
+    FILE* f = NULL;
+    _wfopen_s(&f, OutputPath, L"w");
+
+    if (f) {
+        fprintf(f, "/*\n    The following animation names were extracted from version %s:\n*/\n\n", Version);
+
+        // Read strings in the animation name array up to the first unaddressable value.
+        for (int ii = 0; ; ++ii) {
+            CHAR String[256];
+
+            if (ReadProcessStringPointer<POINTER_TYPE>(hProcess, Offset, String, sizeof(String)) == FALSE) {
+                break;
+            }
+
+            fprintf_s(f, "/* %4d */ \"%s\",\n", ii, String);
+            Offset += sizeof(POINTER_TYPE);
+        }
+
+        fclose(f);
+        return TRUE;
+    } else {
+        fprintf_s(stderr, "failed to open output file: \"%S\"\n", OutputPath);
+        return FALSE;
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -132,7 +190,7 @@ BOOL QueryFileVersion(LPWSTR lpFilename, LPSTR lpBuffer, SIZE_T dwBufferSize)
 //------------------------------------------------------------------------------
 int wmain(int argc, wchar_t* argv[], wchar_t* envp[])
 {
-    LPWSTR ExecutablePath = (argc > 1) ? argv[1] : L"G:\\assets\\wow-beta\\WowB-64.exe";
+    LPWSTR ExecutablePath = (argc > 1) ? argv[1] : L"G:\\assets\\wow-beta\\WowB.exe";
     LPWSTR OutputPath = (argc > 2) ? argv[2] : L"wow-anims.txt";
 
     CHAR Version[0x100];
@@ -165,43 +223,35 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[])
     std::vector<MEMORY_BASIC_INFORMATION> MemoryInfo = ScanProcessMemory(ProcessInfo.hProcess);
 
     // Search process memory for the first instance of the string "Stand" which
-    // is the name of the animation with id 0.
+    // is the name of the first animation in the array of animation names.
     SIZE_T AddressOfStand = SearchProcessMemory(ProcessInfo.hProcess,
                                                 MemoryInfo,
-                                                "Stand",
-                                                6);
+                                                "Stand");
 
-    // Search process memory for the first instance of a pointer to "Stand" which
-    // will be the beginning of the array of animation names.
-    SIZE_T Offset = SearchProcessMemory(ProcessInfo.hProcess,
-                                        MemoryInfo,
-                                        &AddressOfStand,
-                                        sizeof(AddressOfStand));
+    // Check whether the process is running under WOW64, i.e. a 32-bit process
+    // running on 64-bit Windows.
+    BOOL bIsWow64Process = FALSE;
+    IsWow64Process(ProcessInfo.hProcess, &bIsWow64Process);
 
-    FILE* f = NULL;
-    _wfopen_s(&f, OutputPath, L"w");
-
-    if (f) {
-        fprintf(f, "/*\n    The following animation names were extracted from version %s:\n*/\n\n", Version);
-
-        // Read strings in the animation name array up to the first unaddressable value.
-        for (int ii = 0; ; ++ii) {
-            CHAR String[256];
-            CHAR Buffer[256];
-
-            if (ReadProcessStringPointer(ProcessInfo.hProcess, Offset, String, sizeof(String)) == FALSE) {
-                break;
-            }
-
-            sprintf_s(Buffer, "/* %4d */ \"%s\",\n", ii, String);
-            fprintf(f, "%s", Buffer);
-            OutputDebugStringA(Buffer);
-            Offset += sizeof(Offset);
-        }
-
-        fclose(f);
+    BOOL bScanResult = FALSE;
+    if (bIsWow64Process == TRUE) {
+        // If the process is running under WOW64 then scan for 32-bit pointers.
+        bScanResult = ScanAnimations<DWORD>(OutputPath,
+                                            Version,
+                                            ProcessInfo.hProcess,
+                                            MemoryInfo,
+                                            (DWORD)AddressOfStand);
     } else {
-        fprintf_s(stderr, "failed to open output file: \"%S\"\n", OutputPath);
+        // Otherwise perform the scan using the native pointer size.
+        bScanResult = ScanAnimations<SIZE_T>(OutputPath,
+                                             Version,
+                                             ProcessInfo.hProcess,
+                                             MemoryInfo,
+                                             AddressOfStand);
+    }
+
+    if (bScanResult == FALSE) {
+        fprintf_s(stderr, "failed to export animations\n");
     }
 
     // Terminate the target process and clean up handles.
