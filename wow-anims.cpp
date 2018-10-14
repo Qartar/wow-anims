@@ -1,5 +1,8 @@
 #include <Windows.h>
+#include <PathCch.h>
 #include <cstdio>
+#include <iomanip>
+#include <sstream>
 #include <vector>
 
 template<typename T> T Min(T a, T b) { return a < b ? a : b; }
@@ -118,9 +121,7 @@ BOOL ReadProcessStringPointer(
 
 //------------------------------------------------------------------------------
 template<typename POINTER_TYPE>
-BOOL ScanAnimations(
-    LPCWSTR OutputPath,
-    LPCSTR Version,
+std::vector<std::string> ScanAnimations(
     HANDLE hProcess,
     std::vector<MEMORY_BASIC_INFORMATION> const& MemoryInfo,
     POINTER_TYPE AddressOfStand)
@@ -132,35 +133,100 @@ BOOL ScanAnimations(
                                         &AddressOfStand,
                                         sizeof(AddressOfStand));
 
+    std::vector<std::string> Animations;
+
     // Failed to find the beginning of the array of animation names.
     if (Offset == 0) {
-        return FALSE;
+        fprintf_s(stderr, "failed to find beginning of the array of animation names\n");
+        return Animations;
     }
 
-    FILE* f = NULL;
-    _wfopen_s(&f, OutputPath, L"w");
+    // Read strings in the animation name array up to the first unaddressable value.
+    for (int ii = 0; ; ++ii) {
+        CHAR String[256];
 
-    if (f) {
-        fprintf(f, "/*\n    The following animation names were extracted from version %s:\n*/\n\n", Version);
-
-        // Read strings in the animation name array up to the first unaddressable value.
-        for (int ii = 0; ; ++ii) {
-            CHAR String[256];
-
-            if (ReadProcessStringPointer<POINTER_TYPE>(hProcess, Offset, String, sizeof(String)) == FALSE) {
-                break;
-            }
-
-            fprintf_s(f, "/* %4d */ \"%s\",\n", ii, String);
-            Offset += sizeof(POINTER_TYPE);
+        if (ReadProcessStringPointer<POINTER_TYPE>(hProcess, Offset, String, sizeof(String)) == FALSE) {
+            break;
         }
 
+        Animations.emplace_back(String);
+        Offset += sizeof(POINTER_TYPE);
+    }
+
+    return Animations;
+}
+
+//------------------------------------------------------------------------------
+BOOL Export(LPCWSTR OutputPath, LPCWSTR Extension, std::string const& String)
+{
+    WCHAR Filename[0x200] = {};
+    PathCchAppend(Filename, _countof(Filename), OutputPath);
+    PathCchRemoveExtension(Filename, _countof(Filename));
+    PathCchAddExtension(Filename, _countof(Filename), Extension);
+
+    FILE* f = NULL;
+    _wfopen_s(&f, Filename, L"w");
+
+    if (f) {
+        fprintf(f, "%s", String.c_str());
         fclose(f);
         return TRUE;
     } else {
-        fprintf_s(stderr, "failed to open output file: \"%S\"\n", OutputPath);
+        fprintf_s(stderr, "failed to open output file: \"%S\"\n", Filename);
         return FALSE;
     }
+}
+
+//------------------------------------------------------------------------------
+BOOL ExportInline(LPCWSTR OutputPath, LPCSTR Version, std::vector<std::string> const& Animations)
+{
+    std::ostringstream Stream;
+
+    Stream << "/*" << std::endl;
+    Stream << "    Starting in 7.3.0.24500 animation names are no longer included in" << std::endl;
+    Stream << "    animationdata.db2 and are instead embedded directly into the WoW client." << std::endl;
+    Stream << "    The following animation names were extracted from version " << Version << ":" << std::endl;
+    Stream << "*/" << std::endl << std::endl;
+
+    for (std::size_t ii = 0, sz = Animations.size(); ii < sz; ++ii) {
+        Stream << "/* " << std::setw(4) << ii << " */ \"" << Animations[ii] << "\"," << std::endl;
+    }
+
+    return Export(OutputPath, L"inl", Stream.str());
+}
+
+//------------------------------------------------------------------------------
+BOOL ExportMarkdown(LPCWSTR OutputPath, LPCSTR Version, std::vector<std::string> const& Animations)
+{
+    std::ostringstream Stream;
+
+    Stream << "Starting in 7.3.0.24500 animation names are no longer included in" << std::endl;
+    Stream << "`animationdata.db2` and are instead embedded directly into the WoW client." << std::endl;
+    Stream << "The following animation names were extracted from version " << Version << ":" << std::endl << std::endl;
+
+    const std::size_t w = 80 - strlen("|   ID | "/*Name*/" |");
+
+    Stream << "|   ID | " << std::setw(w) << std::left << "Name" << " |" << std::endl;
+    Stream << "|------|-" << std::setw(w) << std::setfill('-') << "----" << std::setfill(' ') << "-|" << std::endl;
+    for (std::size_t ii = 0, sz = Animations.size(); ii < sz; ++ii) {
+        Stream << "| " << std::setw(4) << std::right << ii
+               << " | " << std::setw(w) << std::left << Animations[ii] << " |" << std::endl;
+    }
+
+    return Export(OutputPath, L"md", Stream.str());
+}
+
+//------------------------------------------------------------------------------
+BOOL ExportCSV(LPCWSTR OutputPath, LPCSTR Version, std::vector<std::string> const& Animations)
+{
+    std::ostringstream Stream;
+
+    Stream << "ID;Name" << std::endl;
+    for (std::size_t ii = 0, sz = Animations.size(); ii < sz; ++ii) {
+        Stream << ii << ";" << Animations[ii] << std::endl;
+    }
+
+    return Export(OutputPath, L"csv", Stream.str());
 }
 
 //------------------------------------------------------------------------------
@@ -190,8 +256,37 @@ BOOL QueryFileVersion(LPWSTR lpFilename, LPSTR lpBuffer, SIZE_T dwBufferSize)
 //------------------------------------------------------------------------------
 int wmain(int argc, wchar_t* argv[], wchar_t* envp[])
 {
-    LPWSTR ExecutablePath = (argc > 1) ? argv[1] : L"G:\\assets\\wow-beta\\WowB.exe";
-    LPWSTR OutputPath = (argc > 2) ? argv[2] : L"wow-anims.txt";
+    BOOL bExportInline = FALSE;
+    BOOL bExportMarkdown = FALSE;
+    BOOL bExportCSV = FALSE;
+    LPWSTR ExecutablePath =  L"G:\\assets\\wow-beta\\WowB.exe";
+    LPWSTR OutputPath = L"wow-anims.txt";
+
+    // Parse command line arguments
+    {
+        for (int narg = 1, parg = 0; narg < argc; ++narg) {
+            if (!_wcsicmp(argv[narg], L"--inl")) {
+                bExportInline = TRUE;
+            } else if (!_wcsicmp(argv[narg], L"--md")) {
+                bExportMarkdown = TRUE;
+            } else if (!_wcsicmp(argv[narg], L"--csv")) {
+                bExportCSV = TRUE;
+            } else if (parg == 0) {
+                ExecutablePath = argv[narg];
+                ++parg;
+            } else if (parg == 1) {
+                OutputPath = argv[narg];
+                ++parg;
+            } else {
+                fprintf_s(stderr, "unrecognized argument: \"%S\\n", argv[narg]);
+                return -1;
+            }
+        }
+
+        if (!(bExportInline || bExportCSV || bExportMarkdown)) {
+            bExportInline = TRUE;
+        }
+    }
 
     CHAR Version[0x100];
     if (QueryFileVersion(ExecutablePath, Version, sizeof(Version)) == FALSE) {
@@ -233,25 +328,17 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[])
     BOOL bIsWow64Process = FALSE;
     IsWow64Process(ProcessInfo.hProcess, &bIsWow64Process);
 
-    BOOL bScanResult = FALSE;
+    std::vector<std::string> Animations;
     if (bIsWow64Process == TRUE) {
         // If the process is running under WOW64 then scan for 32-bit pointers.
-        bScanResult = ScanAnimations<DWORD>(OutputPath,
-                                            Version,
-                                            ProcessInfo.hProcess,
-                                            MemoryInfo,
-                                            (DWORD)AddressOfStand);
+        Animations = ScanAnimations<DWORD>(ProcessInfo.hProcess,
+                                           MemoryInfo,
+                                           (DWORD)AddressOfStand);
     } else {
         // Otherwise perform the scan using the native pointer size.
-        bScanResult = ScanAnimations<SIZE_T>(OutputPath,
-                                             Version,
-                                             ProcessInfo.hProcess,
-                                             MemoryInfo,
-                                             AddressOfStand);
-    }
-
-    if (bScanResult == FALSE) {
-        fprintf_s(stderr, "failed to export animations\n");
+        Animations = ScanAnimations<SIZE_T>(ProcessInfo.hProcess,
+                                            MemoryInfo,
+                                            AddressOfStand);
     }
 
     // Terminate the target process and clean up handles.
@@ -264,6 +351,17 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[])
 
     if (ProcessInfo.hProcess) {
         CloseHandle(ProcessInfo.hProcess);
+    }
+
+    // Export to desired formats
+    if (bExportInline) {
+        ExportInline(OutputPath, Version, Animations);
+    }
+    if (bExportMarkdown) {
+        ExportMarkdown(OutputPath, Version, Animations);
+    }
+    if (bExportCSV) {
+        ExportCSV(OutputPath, Version, Animations);
     }
 
     return 0;
